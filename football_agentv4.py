@@ -8,6 +8,8 @@ load_dotenv()
 """
 Documentation:
 
+THIS FILE DOESNT WORK
+
 Earlier documentation for football_agent.py and football_agentv2.py:
 
 Early development, figuring out API's:
@@ -41,7 +43,7 @@ from fairlib import (
     SimpleAgent,
 )
 
-
+from vegas_tool import VegasOddsTool, RealOddsProvider
 
 # =================== CONFIG: ALWAYS PROSE ===================
 PROSE_FINAL_SPEC = textwrap.dedent("""
@@ -98,25 +100,23 @@ def get_web_searcher_tool(cse_search_api, cse_engine_id):
 
 # =================== PROMPTS (WORKERS) ===================
 RESEARCHER_PROMPT_BASE = textwrap.dedent("""
-You are a fantasy football researcher. Use your web_searcher tool when needed.
+You are a fantasy football researcher. Use web_searcher when needed.
+You can also call vegas_odds to fetch the real spread/total/moneyline for the next matchup
+(e.g., 'Away @ Home' or JSON {{ "home": "...", "away": "..." }}).
 
 USER QUESTION:
 {user_query}
 
 TASK:
-1) Identify the relevant NFL player(s) for this question.
-2) For each player, gather concise, fantasy-relevant stats:
-   - season PPG (half-PPR if available),
-   - last-3 PPG,
-   - role/snap share if available (or 'unknown'),
-   - injury status (healthy/questionable/out/unknown),
-   - turnovers (for QBs) or rushing TDs (for QBs/RBs) if available.
-3) Provide a one-sentence rest-of-season outlook per player.
-4) Give 2–3 short source attributions (names only: ESPN, FantasyData, PFF, CBS, etc.).
-5) Output short, crisp prose. No tables. No JSON. Keep it under ~12 lines total.
-
-If any stat is unavailable, state 'unknown'.
+1) Identify the relevant NFL player(s) and their next opponent.
+2) Retrieve concise, fantasy-relevant stats: season PPG, last-3 PPG, role/snap, injury.
+3) Fetch real lines via vegas_odds and mention spread/total (and movement if available).
+4) Provide a one-sentence ROS outlook per player.
+5) Cite 2–3 short sources (names only). Keep under ~12 lines, no tables, no JSON.
+If a stat is unavailable, say 'unknown'.
 """).strip()
+
+
 
 ANALYST_PROMPT_BASE = textwrap.dedent("""
 You are a fantasy football analyst. You can use the safe calculator for arithmetic if needed.
@@ -213,8 +213,13 @@ async def run_pipeline(user_query: str) -> str:
     researcher = create_worker_agent(
         llm,
         [get_web_searcher_tool(settings.search_engine.google_cse_search_api,
-                               settings.search_engine.google_cse_search_engine_id)],
-        "A research agent that uses a web search tool to find current, real-time information on NFL players."
+                               settings.search_engine.google_cse_search_engine_id),
+        VegasOddsTool(provider=RealOddsProvider(
+            bookmakers=['draftkings','fanduel'],
+            window_hours=10*24,
+        )),
+        ],
+        "A research agent that uses a web search tool for player info and vegas_odds for real lines."
     )
 
     analyst = create_worker_agent(
@@ -275,7 +280,7 @@ async def main():
     print("Football Manager (Prose Mode)")
     print("=" * 60)
 
-    user_query = "Should I trade Drake London and Ashton Jeanty for Jahmyr Gibbs?"
+    user_query = "Should I trade Drake London for Jahmyr Gibbs?"
     print("\nUSER QUERY:", user_query)
 
     answer = await run_pipeline(user_query)

@@ -156,3 +156,73 @@ Ryan R (rrabinow@uccs.edu)
 Austin W (austin.w@ardentinc.com)
 Eli G (elijah.g@ardentinc.com)
 Chad M (Chad.Mello@afacademy.af.edu)
+
+
+# Design Choices (FOR FINAL SUBMISSION)
+
+NOTE: football_agentv6.py is the final form of this pipeline and the one we plan to present in class.
+
+Our project uses an agentic framework for evaluating Fantasy Football decisions. To build the model, we used the FairLLM framework with GPT-4 as the LLM. The framework is able to successfully gather information on players using the internet, does computation to evaluate relevant stats, and return a clear output that gives a verdict on the trade.
+
+## Overall Goal
+
+Goal of the project was to create a agentic framework able to evaluate Fantasy Football decisions using up to date information.
+
+## Design Choices
+
+This is a multi-agent framework using a manager that employs other agents to do the work necessary to solve the users query.
+
+### Tool Description
+
+The framework uses two tools built into the FairLLM framework:
+
+1. WebSearcherTool: Accesses the internet to find relevant and up to date information on players given in the user query, including injury status, and performance metrics (yards/game, touchdowns, etc.)
+
+2. SafeCalculatorTool: Able to do accurate math calculations using equations given by an agent. Used to find metrics to compare players, including Points-per-game deltas.
+
+These two tools suffice to compare player performance to evaluate decisions.
+
+Of note, we attempted to implement a vegas_tool (in vegas_tool.py) to implement betting odds into the decision making process but this did not work due to network restrictions. However, the WebSearcherTool is still able to deliver enough metrics to make a comparison.
+
+### Agent Description
+We created several agents as a part of the multi-agent framework:
+
+1. researcher: Uses the WebSearcherTool to find current information on NFL players
+2. analyst: Performs mathematical calculations to compare players
+3. auditor: Examines and verifies research for consistency or missing sources, and delivers an overall confidence level.
+4. synthesizer: Takes information from the researcher, analyst, and auditor, then produces the final output.
+5. manager: Plans how to use the worker agents given the user query. 
+
+### Pipeline
+
+These are the steps in the models pipeline:
+
+1. After user gives query, build tools and agents
+2. Manager agent interprets user query and builds evaluation plan
+3. worker agents are called in accordance with evaluation plan to gather information and synthesize a response. For example:
+  - researcher called to gather information
+  - auditor called to evaluate information gathered
+  - analyst calculates metrics between players
+  - synthesizer takes all information to create final response
+4. Response returned to user
+
+## Outputs and functionality
+
+The pipeline is designed to handle several Fantasy Football Decisions:
+1. trade
+2. start_sit
+3. hold_drop
+
+The model outputs according to the following format:
+Line 1: Verdict (HOLD|DROP|START|SIT|FAIR|FAVORABLE|UNFAVORABLE)
+Line 2-4: Why - 2 to 4 sentences
+Line 5: Quick stats
+Line 6: Sources
+
+## Limitations
+- The model does not have access to fantasy rosters which might play a factor in some trade decisions
+- The model was not designed to factor in more than two players at once. Trade decisions involving more than two players (e.g. 2 for 1) are possible but may not be accurate
+
+## Known bugs
+- Sometimes the output will display in a JSON format. While still readable, this is does not look good and is unintended. Steps taken to mitigate include instructing at all steps to not output JSON formats.
+

@@ -26,6 +26,9 @@ Attempting to implement a vegas and weather tool. Abandoned weather because it i
 Complicated:
 https://chatgpt.com/share/691113fd-6b80-8006-a4cf-2943edc72527
 
+This version added in proper manager workflow and chatbot functionality:
+https://chatgpt.com/share/69169c61-2130-8006-bad6-c13cb822ed4e
+
 """
 
 # fairlib core
@@ -40,8 +43,6 @@ from fairlib import (
     ReActPlanner,
     SimpleAgent,
 )
-
-
 
 # =================== CONFIG: ALWAYS PROSE ===================
 PROSE_FINAL_SPEC = textwrap.dedent("""
@@ -67,6 +68,10 @@ from typing import Literal
 TaskType = Literal["trade", "start_sit", "hold_drop"]
 
 def classify_task(user_query: str) -> TaskType:
+    """
+    Simple heuristic classifier for the fantasy question type.
+    Acts as a deterministic 'manager helper' for routing.
+    """
     q = user_query.lower()
     if ("trade" in q) or ((" for " in q) and not any(x in q for x in ["start", "sit", "bench"])):
         return "trade"
@@ -118,11 +123,37 @@ TASK:
 If any stat is unavailable, state 'unknown'.
 """).strip()
 
+# === NEW: AUDITOR PROMPT (Upgrade A: Research Verifier) ===
+AUDITOR_PROMPT_BASE = textwrap.dedent("""
+You are a fantasy football research auditor.
+
+USER QUESTION:
+{user_query}
+
+RESEARCH SUMMARY (from the researcher agent):
+{research_block}
+
+YOUR TASK:
+- Check the research for:
+  - Obvious inconsistencies in stats (e.g., conflicting PPG numbers for the same player).
+  - Missing or vague source attributions.
+  - Overly confident claims when stats are 'unknown' or clearly uncertain.
+- In 3–6 short sentences:
+  - Comment on the overall reliability of the research (e.g., HIGH, MEDIUM, or LOW CONFIDENCE).
+  - Point out any specific issues or uncertainties.
+  - If everything looks reasonable, say so explicitly.
+
+Do NOT redo the web search. Do NOT introduce new stats. Just audit what you see.
+""").strip()
+
 ANALYST_PROMPT_BASE = textwrap.dedent("""
 You are a fantasy football analyst. You can use the safe calculator for arithmetic if needed.
 
 CONTEXT (from research):
 {research_block}
+
+AUDITOR NOTES (on research quality):
+{audit_block}
 
 USER QUESTION:
 {user_query}
@@ -135,18 +166,50 @@ TASK:
 
 OUTPUT REQUIREMENTS:
 - Short prose summary of the key computed deltas and trends.
+- Mention if auditor labeled the research as LOW CONFIDENCE.
 - No JSON. Keep it under ~8 lines.
 """).strip()
 
-# =================== PROMPTS (FINAL SYNTHESIS) ===================
+# =================== PROMPTS (MANAGER & FINAL SYNTHESIS) ===================
+
+# === NEW: MANAGER PROMPT (Upgrade C: Manager + Workers) ===
+MANAGER_PROMPT_BASE = textwrap.dedent("""
+You are the manager agent for a fantasy football assistant.
+
+You have the following worker agents:
+- Researcher: can use web tools to gather current stats, roles, injuries, and short ROS outlooks.
+- Auditor: checks the research for consistency, missing sources, and flags LOW/MEDIUM/HIGH CONFIDENCE.
+- Analyst: uses the research (and audit notes) to compute deltas, trends, and replacement-level comparisons.
+- Synthesizer: produces the final decision in a strict prose format for the user.
+
+USER QUESTION:
+{user_query}
+
+CLASSIFIED TASK TYPE:
+{task_type}
+
+TASK:
+- In 3–5 short bullet points, describe:
+  - Which workers should be called,
+  - In what order,
+  - And what each should focus on for this specific question.
+- Do NOT call tools. Do NOT output JSON. Just give the plan as plain text bullets.
+""").strip()
+
 FINAL_SYNTHESIS_TRADE = textwrap.dedent("""
 You are the team manager. Produce the final decision in the required prose format.
 
 USER QUESTION:
 {user_query}
 
+MANAGER PLAN:
+{manager_plan}
+
 RESEARCH SUMMARY:
 {research_block}
+
+AUDITOR SUMMARY:
+{audit_block}
 
 ANALYST SUMMARY:
 {analyst_block}
@@ -154,6 +217,7 @@ ANALYST SUMMARY:
 DECISION RULES (apply sensibly):
 - Choose: FAIR | FAVORABLE | UNFAVORABLE (for the user trading away Player A for Player B).
 - Consider PPG, last-3 trend, turnovers, injuries/OL notes, near-term schedule, ROS outlook.
+- Take into account if the auditor flagged LOW CONFIDENCE and soften the verdict if needed.
 - Tie-breaker: if season PPG delta within ±0.5, break ties using trend + schedule; if still tied → FAIR.
 
 Now write ONLY the final answer using this format:
@@ -166,8 +230,14 @@ You are the team manager. Produce the final decision in the required prose forma
 USER QUESTION:
 {user_query}
 
+MANAGER PLAN:
+{manager_plan}
+
 RESEARCH SUMMARY:
 {research_block}
+
+AUDITOR SUMMARY:
+{audit_block}
 
 ANALYST SUMMARY:
 {analyst_block}
@@ -175,6 +245,7 @@ ANALYST SUMMARY:
 DECISION RULES:
 - Output START if season PPG ≥ 12 or last-3 ≥ season and trend up; penalize material injury/snap loss or tough schedule next 2–3.
 - Otherwise SIT.
+- If auditor labeled the research as LOW CONFIDENCE, be more conservative and mention uncertainty in the prose.
 
 Now write ONLY the final answer using this format:
 {prose_spec}
@@ -186,8 +257,14 @@ You are the team manager. Produce the final decision in the required prose forma
 USER QUESTION:
 {user_query}
 
+MANAGER PLAN:
+{manager_plan}
+
 RESEARCH SUMMARY:
 {research_block}
+
+AUDITOR SUMMARY:
+{audit_block}
 
 ANALYST SUMMARY:
 {analyst_block}
@@ -196,20 +273,39 @@ DECISION RULES:
 - HOLD if replacement_delta ≥ +2.0 or trend up with last-3 ≥ season.
 - DROP if replacement_delta ≤ 0 and trend down or multiweek OUT.
 - Otherwise HOLD.
+- If auditor labeled the research as LOW CONFIDENCE, lean toward HOLD unless the player is clearly unstartable.
 
 Now write ONLY the final answer using this format:
 {prose_spec}
 """).strip()
 
-# =================== MAIN ORCHESTRATION (NO JSON) ===================
-async def run_pipeline(user_query: str) -> str:
+# =================== MAIN ORCHESTRATION (MANAGER + WORKERS, NO JSON) ===================
+# =================== MAIN ORCHESTRATION (MANAGER + WORKERS, NO JSON) ===================
+async def run_pipeline(user_query: str, return_debug: bool = False):
+    """
+    Top-level 'manager' pipeline that:
+      1) Classifies the task.
+      2) Uses a Manager agent to plan worker usage.
+      3) Calls Researcher → Auditor → Analyst → Synthesizer.
+
+    If return_debug=False (default): returns the final prose verdict (str).
+    If return_debug=True: returns a dict with intermediate artifacts:
+        {
+            "task_type": ...,
+            "manager_plan": ...,
+            "research_block": ...,
+            "audit_block": ...,
+            "analyst_block": ...,
+            "final_answer": ...
+        }
+    """
     # Core LLM for synthesis and to drive workers' planners
     llm = OpenAIAdapter(
         api_key=settings.api_keys.openai_api_key,
         model_name=settings.models["openai_gpt4"].model_name
     )
 
-    # Build workers
+    # === Build worker agents ===
     researcher = create_worker_agent(
         llm,
         [get_web_searcher_tool(settings.search_engine.google_cse_search_api,
@@ -223,69 +319,135 @@ async def run_pipeline(user_query: str) -> str:
         "An analyst agent that performs mathematical calculations and trend checks for NFL player comparisons."
     )
 
-    # Step 1: classify task
-    task_type = classify_task(user_query)
+    auditor = create_worker_agent(
+        llm,
+        [],
+        "A verification agent that audits research for consistency, missing sources, and overall confidence level."
+    )
 
-    # Step 2: Research
-    research_prompt = RESEARCHER_PROMPT_BASE.format(user_query=user_query)
-    research_block = await researcher.arun(research_prompt)
-
-    # Step 3: Analyst
-    analyst_prompt = ANALYST_PROMPT_BASE.format(user_query=user_query, research_block=research_block)
-    analyst_block = await analyst.arun(analyst_prompt)
-
-    # Step 4: Final synthesis in prose only
-    # ...after you build research_block and analyst_block
-
-    # 4) Final synthesis in prose only — use a tool-less SimpleAgent
     synthesizer = create_worker_agent(
         llm,
         [],  # no tools
-    "You are the final-decider. Produce ONLY the final prose answer in the required format."
+        "You are the final-decider. Produce ONLY the final prose answer in the required format."
     )
 
+    manager = create_worker_agent(
+        llm,
+        [],  # no tools
+        "You are the manager agent. You plan how to use the worker agents given the user's question."
+    )
+
+    # Step 1: classify task (deterministic helper)
+    task_type = classify_task(user_query)
+
+    # Step 2: Manager plans the workflow (Upgrade C)
+    manager_prompt = MANAGER_PROMPT_BASE.format(
+        user_query=user_query,
+        task_type=task_type
+    )
+    manager_plan = await manager.arun(manager_prompt)
+
+    # Step 3: Research
+    research_prompt = RESEARCHER_PROMPT_BASE.format(user_query=user_query)
+    research_block = await researcher.arun(research_prompt)
+
+    # Step 4: Audit the research (Upgrade A)
+    auditor_prompt = AUDITOR_PROMPT_BASE.format(
+        user_query=user_query,
+        research_block=research_block
+    )
+    audit_block = await auditor.arun(auditor_prompt)
+
+    # Step 5: Analyst
+    analyst_prompt = ANALYST_PROMPT_BASE.format(
+        user_query=user_query,
+        research_block=research_block,
+        audit_block=audit_block
+    )
+    analyst_block = await analyst.arun(analyst_prompt)
+
+    # Step 6: Final synthesis in prose only
     if task_type == "trade":
         synth_prompt = FINAL_SYNTHESIS_TRADE.format(
             user_query=user_query,
+            manager_plan=manager_plan,
             research_block=research_block,
+            audit_block=audit_block,
             analyst_block=analyst_block,
             prose_spec=PROSE_FINAL_SPEC
         )
     elif task_type == "start_sit":
         synth_prompt = FINAL_SYNTHESIS_STARTSIT.format(
             user_query=user_query,
+            manager_plan=manager_plan,
             research_block=research_block,
+            audit_block=audit_block,
             analyst_block=analyst_block,
             prose_spec=PROSE_FINAL_SPEC
         )
     else:
         synth_prompt = FINAL_SYNTHESIS_HOLDDROP.format(
             user_query=user_query,
+            manager_plan=manager_plan,
             research_block=research_block,
+            audit_block=audit_block,
             analyst_block=analyst_block,
             prose_spec=PROSE_FINAL_SPEC
         )
 
-    final_answer = await synthesizer.arun(synth_prompt)  # ← instead of llm.arun(...)
-    return str(final_answer).strip()
+    final_answer = await synthesizer.arun(synth_prompt)
+    final_answer = str(final_answer).strip()
 
-# =================== CLI ENTRY ===================
+    if return_debug:
+        return {
+            "task_type": task_type,
+            "manager_plan": str(manager_plan).strip(),
+            "research_block": str(research_block).strip(),
+            "audit_block": str(audit_block).strip(),
+            "analyst_block": str(analyst_block).strip(),
+            "final_answer": final_answer,
+        }
+    else:
+        return final_answer
+
+# =================== CLI ENTRY: INTERACTIVE LOOP ===================
 async def main():
-    print("=" * 60)
-    print("Football Manager (Prose Mode)")
-    print("=" * 60)
+    print("=" * 70)
+    print("Football Manager (Interactive, showing manager plan + worker outputs)")
+    print("Type 'quit' or 'exit' to end.")
+    print("=" * 70)
 
-    user_query = "Should I trade Drake London and Ashton Jeanty for Jahmyr Gibbs?"
-    print("\nUSER QUERY:", user_query)
+    while True:
+        user_query = input("\nYou: ").strip()
+        if user_query.lower() in {"quit", "exit"}:
+            print("Goodbye- may your waiver claims always clear.")
+            break
+        if not user_query:
+            continue
 
-    answer = await run_pipeline(user_query)
+        # Run full pipeline with debug info so we can show the 'thoughts/actions'
+        result = await run_pipeline(user_query, return_debug=True)
 
-    print("\n" + "-" * 60)
-    print("FINAL PROSE ANSWER")
-    print("-" * 60)
-    print(answer)
-    print("-" * 60)
+        print("\n" + "-" * 70)
+        print(f"TASK TYPE: {result['task_type']}")
+        print("-" * 70)
+
+        print("\n[MANAGER PLAN]")
+        print(result["manager_plan"])
+
+        print("\n[RESEARCHER OUTPUT]")
+        print(result["research_block"])
+
+        print("\n[AUDITOR OUTPUT]")
+        print(result["audit_block"])
+
+        print("\n[ANALYST OUTPUT]")
+        print(result["analyst_block"])
+
+        print("\n[FINAL ANSWER]")
+        print(result["final_answer"])
+        print("-" * 70)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
-
