@@ -34,7 +34,7 @@ https://chatgpt.com/share/69169ca2-0ba4-8006-938b-6052b89ae930
 
 Finally, this thread evaluates the README summary and clarifies any last
 minute questions on the code while commenting. Also generated a png of code structure:
-
+https://chatgpt.com/share/691e4232-e1b8-8006-bd58-ddcd9fd960b8
 
 """
 
